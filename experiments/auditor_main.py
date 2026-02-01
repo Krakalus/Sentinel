@@ -24,10 +24,10 @@ import gc
 from datetime import datetime
 from rich.console import Console
 from rich.progress import track
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Sentinel Imports
-from experiments.utils.apollo_adapter import ApolloAdapter
+from experiments.tasks.liars_bench_adapter import LiarsBenchAdapter
 from experiments.utils.harvester import ActivationHarvester
 from experiments.utils.deception_probe import OrthogonalProbe
 from experiments.utils.pareto import ParetoCombiner
@@ -119,47 +119,40 @@ def main():
         console.print(f"Error: {e}")
         return
 
-    # 2. ROBUST MODEL LOADING (Auto-Recovery Logic)
-    model = None
-    try:
-        # Attempt 1: High Performance Mode (Flash Attention)
-        # This is preferred for H100 but requires compiled drivers
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            device_map="auto",
-            torch_dtype=dtype,
-            attn_implementation="flash_attention_2" if args.precision == "BF16" and torch.cuda.is_available() else "eager"
-        )
-    except Exception as e:
-        console.print(f"[yellow][!] High-Performance Load Failed ({str(e)}). Retrying with Safe Mode...[/yellow]")
-        try:
-            # Attempt 2: Safe Mode (Eager Execution)
-            # This is slower but works on almost any setup
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model,
-                device_map="auto",
-                torch_dtype=dtype,
-                attn_implementation="eager"
-            )
-            console.print("[green]✔ Model loaded in Safe Mode.[/green]")
-        except Exception as e2:
-            console.print(f"[bold red]FATAL: Model load failed.[/bold red]")
-            console.print(f"Error: {e2}")
-            
-            # Diagnostic for the user
-            if "LlamaForCausalLM" in str(e2) or "ImportError" in str(e2):
-                console.print("\n[bold yellow]DIAGNOSTIC:[/bold yellow] Your 'transformers' library is too old.")
-                console.print("Run this command in terminal: [green]pip install --upgrade transformers accelerate[/green]")
-            return
+    # 2. TWIN-STREAM MODEL LOADING (Hypothesis 1: Deception Horizon)
+    console.print(f"[bold]Initializing Twin-Stream Architecture...[/bold]")
 
-    model.eval()
+    # Stream A: Reference (High Precision - BF16)
+    console.print("   [1/2] Loading Reference Stream (BF16)...")
+    model_hi = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
+    )
+    model_hi.eval()
+
+    # Stream B: Stress Test (Low Precision - NF4)
+    # This implements "Quantization as Structural Stress"
+    console.print("   [2/2] Loading Stress Stream (NF4)...")
+    nf4_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
+    model_lo = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        quantization_config=nf4_config,
+        device_map="auto"
+    )
+    model_lo.eval()
 
     # 3. DATA INGESTION
-    data_path = os.path.join(project_root, "data/raw/obfuscation_dataset.jsonl")
-    console.print(f"[bold]Ingesting Data from:[/bold] {data_path}")
-    
-    adapter = ApolloAdapter()
-    data_pairs = adapter.load_dataset(data_path)
+    console.print(f"[bold]Ingesting Liars Bench...[/bold]") 
+
+    adapter = LiarsBenchAdapter()
+    data_pairs = adapter.load_dataset()
     
     texts_U = [d['text_unmonitored'] for d in data_pairs]
     texts_M = [d['text_monitored'] for d in data_pairs]
@@ -175,31 +168,41 @@ def main():
     best_probe = None
     best_acts_U = None
     
-    if hasattr(model.config, "num_hidden_layers"):
-        args.scan_end = min(args.scan_end, model.config.num_hidden_layers - 1)
-    
+    if hasattr(model_hi.config, "num_hidden_layers"):
+        args.scan_end = min(args.scan_end, model_hi.config.num_hidden_layers - 1)
+
     console.print(f"\n[bold]Initiating Forensic Sweep:[/bold] Layers {args.scan_start} to {args.scan_end}")
     
     for layer_idx in track(range(args.scan_start, args.scan_end + 1), description="Scanning Layers..."):
-        harvester = ActivationHarvester(model, tokenizer, layer_idx)
-        
-        # Harvest (VRAM Safe)
-        acts_U = harvester.harvest(texts_U, batch_size=8, verbose=False)
-        acts_M = harvester.harvest(texts_M, batch_size=8, verbose=False)
-        
+
+        # Harvest High Precision (Reference)
+        harvester_hi = ActivationHarvester(model_hi, tokenizer, layer_idx)
+        acts_U_hi = harvester_hi.harvest(texts_U, batch_size=8, verbose=False)
+        acts_M_hi = harvester_hi.harvest(texts_M, batch_size=8, verbose=False)      
+
+        # Harvest Low Precision (Stress)
+        harvester_lo = ActivationHarvester(model_lo, tokenizer, layer_idx)
+        acts_U_lo = harvester_lo.harvest(texts_U, batch_size=8, verbose=False)
+        acts_M_lo = harvester_lo.harvest(texts_M, batch_size=8, verbose=False)
+
+        # --- CORE MECHANIC: DIFFERENTIAL PROBING ---
+        # Calculate Quantization Drift: Delta = High - Low
+        acts_U_diff = acts_U_hi - acts_U_lo
+        acts_M_diff = acts_M_hi - acts_M_lo       
+
         # Probe
         mask_honest = (labels == 0)
         mask_deceptive = (labels == 1)
         
         probe = OrthogonalProbe()
-        probe.fit(acts_U[mask_honest], acts_U[mask_deceptive], acts_M[mask_honest], verbose=False)
+        probe.fit(acts_U_diff[mask_honest], acts_U_diff[mask_deceptive], acts_M_diff[mask_honest], verbose=False)
         
         # Metrics
         raw_norm = 0.0
         if probe.mu_DU is not None:
             raw_norm = (probe.mu_DU - probe.mu_HU).norm().item()
             
-        separation = probe.score(acts_U[mask_deceptive]).mean()
+        separation = probe.score(acts_U_diff[mask_deceptive]).mean()
         
         layer_metrics[layer_idx] = {
             'raw': raw_norm,
@@ -209,10 +212,10 @@ def main():
         if separation > best_score:
             best_score = separation
             best_probe = probe
-            best_acts_U = acts_U
-            
+            best_acts_U = acts_U_diff            
+
         # VRAM SAFETY
-        del harvester, acts_U, acts_M, probe
+        del harvester_hi, harvester_lo, acts_U_hi, acts_U_lo, acts_U_diff, acts_M_hi, acts_M_lo, acts_M_diff, probe
         torch.cuda.empty_cache()
         gc.collect()
 
